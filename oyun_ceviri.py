@@ -37,8 +37,8 @@ except Exception:
 
 events = queue.Queue()
 results = queue.Queue()
-state = {"visible": False, "busy": False, "overlay": None, "note": None}
-translator = GoogleTranslator(source="en", target="tr")
+state = {"visible": False, "busy": False, "overlay": None, "note": None, "job": 0, "started": 0.0}
+translator = GoogleTranslator(source="auto", target="tr")
 
 
 def _g(obj, key):
@@ -92,18 +92,20 @@ def merge_paragraphs(lines):
     return paras
 
 
-def translate_one(text):
-    """Tek bir metni çevir; hız sınırına takılırsa bekleyip tekrar dene."""
-    for attempt in range(4):
+def translate_one(text, deadline):
+    """Tek metni çevir. Hız sınırına takılırsa kısa bekleyip dener, süre dolunca None döner."""
+    while time.time() < deadline:
         try:
-            return translator.translate(text) or text
+            return translator.translate(text)
         except TooManyRequests:
-            time.sleep(1.0 * (attempt + 1))
-    return text
+            time.sleep(1.5)
+        except Exception:
+            return None
+    return None
 
 
-def translate_all(texts):
-    """Metinleri az sayıda istekle çevir (Google hız sınırına takılmamak için)."""
+def translate_all(texts, deadline):
+    """Metinleri az istekle çevir. Çevrilemeyenler None olarak kalır."""
     chunks, cur, cur_len = [], [], 0
     for t in texts:
         if cur and cur_len + len(t) + 1 > 4000:
@@ -117,20 +119,25 @@ def translate_all(texts):
     out = []
     for ch in chunks:
         parts = None
-        try:
-            r = translator.translate("\n".join(ch))
-            cand = r.split("\n") if r else []
-            if len(cand) == len(ch):
-                parts = cand
-        except Exception:
-            parts = None
-        if parts is None:  # Toplu çeviri tutmadıysa tek tek, yavaşça çevir
+        if time.time() < deadline:
+            try:
+                r = translator.translate("\n".join(ch))
+                cand = r.split("\n") if r else []
+                if len(cand) == len(ch):
+                    parts = cand
+            except Exception:
+                parts = None
+        if parts is None:  # Toplu çeviri tutmadıysa tek tek, yavaşça
             parts = []
             for t in ch:
-                parts.append(translate_one(t))
+                parts.append(translate_one(t, deadline) if time.time() < deadline else None)
                 time.sleep(0.25)
         out.extend(parts)
     return out
+
+
+def norm(x):
+    return "".join(c for c in x.lower() if c.isalnum())
 
 
 def log_error(stage):
@@ -146,20 +153,28 @@ def log_error(stage):
         pass
 
 
-def work(img, monitor):
+def work(job, img, monitor):
     stage = "OCR"
     try:
         blocks = merge_paragraphs(read_lines(img))
         stage = "Çeviri"
+        kept = []
         if blocks:
-            translated = translate_all([b[4] for b in blocks])
+            translated = translate_all([b[4] for b in blocks], time.time() + 20)
+            if not any(translated):
+                raise RuntimeError(
+                    "Çeviri sunucusundan yanıt alınamadı (hız sınırı olabilir, 1-2 dk bekleyip tekrar dene)"
+                )
             for b, t in zip(blocks, translated):
-                b[4] = t or b[4]
-        results.put((monitor, blocks, None))
+                if not t or norm(t) == norm(b[4]):
+                    continue  # çevrilemedi veya zaten Türkçe -> dokunma
+                b[4] = t
+                kept.append(b)
+        results.put((job, monitor, kept, None))
     except Exception as e:
         log_error(stage)
         short = f"{type(e).__name__}: {e}"[:200]
-        results.put((monitor, [], f"{stage} hatası -> {short}"))
+        results.put((job, monitor, [], f"{stage} hatası -> {short}"))
 
 
 # ---------------- Arayüz ----------------
@@ -258,23 +273,34 @@ def main():
                     elif not state["busy"]:
                         img, monitor = grab_screen()  # bildirimden ÖNCE yakala
                         state["busy"] = True
+                        state["job"] += 1
+                        state["started"] = time.time()
                         notify(root, "Çevriliyor...")
-                        threading.Thread(target=work, args=(img, monitor), daemon=True).start()
+                        threading.Thread(
+                            target=work, args=(state["job"], img, monitor), daemon=True
+                        ).start()
         except queue.Empty:
             pass
 
         try:
-            monitor, blocks, err = results.get_nowait()
-            state["busy"] = False
-            kill(state["note"])
-            if err:
-                notify(root, err, 10000)
-            elif blocks:
-                show_overlay(root, monitor, blocks)
-            else:
-                notify(root, "Çevrilecek yazı bulunamadı", 2000)
+            job, monitor, blocks, err = results.get_nowait()
+            if job == state["job"]:  # eski/iptal edilmiş işlerin sonucunu yok say
+                state["busy"] = False
+                kill(state["note"])
+                if err:
+                    notify(root, err, 10000)
+                elif blocks:
+                    show_overlay(root, monitor, blocks)
+                else:
+                    notify(root, "Çevrilecek İngilizce yazı bulunamadı", 2500)
         except queue.Empty:
             pass
+
+        # Bekçi: 30 saniyeden uzun sürerse pes et, takılı kalma
+        if state["busy"] and time.time() - state["started"] > 30:
+            state["busy"] = False
+            state["job"] += 1
+            notify(root, "Zaman aşımı: çeviri sunucusu yanıt vermedi. Tekrar dene.", 5000)
 
         root.after(50, poll)
 
