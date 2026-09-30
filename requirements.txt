@@ -1,0 +1,6 @@
+winocr
+mss
+keyboard
+deep-translator
+pillow
+pyinstaller
