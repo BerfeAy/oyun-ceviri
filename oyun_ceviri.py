@@ -7,7 +7,10 @@ F9 : Programdan çık
 """
 
 import ctypes
+import os
 import queue
+import sys
+import traceback
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -87,21 +90,33 @@ def merge_paragraphs(lines):
     return paras
 
 
+def log_error(stage):
+    """Hatayı exe'nin yanındaki hata_log.txt dosyasına yaz."""
+    try:
+        if getattr(sys, "frozen", False):
+            base = os.path.dirname(sys.executable)
+        else:
+            base = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(base, "hata_log.txt"), "a", encoding="utf-8") as f:
+            f.write(f"[{stage}]\n{traceback.format_exc()}\n\n")
+    except Exception:
+        pass
+
+
 def work(img, monitor):
+    stage = "OCR"
     try:
         blocks = merge_paragraphs(read_lines(img))
+        stage = "Çeviri"
         if blocks:
             translated = translator.translate_batch([b[4] for b in blocks])
             for b, t in zip(blocks, translated):
                 b[4] = t or b[4]
         results.put((monitor, blocks, None))
     except Exception as e:
-        msg = str(e)
-        if "ocr" in msg.lower() or "language" in msg.lower():
-            err = "OCR hatası: Windows'a İngilizce dil paketi kurulu mu?"
-        else:
-            err = "Çeviri başarısız oldu (internet bağlantısını kontrol et)"
-        results.put((monitor, [], err))
+        log_error(stage)
+        short = f"{type(e).__name__}: {e}"[:200]
+        results.put((monitor, [], f"{stage} hatası -> {short}"))
 
 
 # ---------------- Arayüz ----------------
@@ -123,7 +138,7 @@ def notify(root, text, ms=None):
     t.attributes("-topmost", True)
     tk.Label(
         t, text=text, bg="#111111", fg="white",
-        font=("Segoe UI", 12, "bold"), padx=16, pady=9,
+        font=("Segoe UI", 12, "bold"), padx=16, pady=9, wraplength=900,
     ).pack()
     t.update_idletasks()
     x = (t.winfo_screenwidth() - t.winfo_reqwidth()) // 2
@@ -210,7 +225,7 @@ def main():
             state["busy"] = False
             kill(state["note"])
             if err:
-                notify(root, err, 4000)
+                notify(root, err, 10000)
             elif blocks:
                 show_overlay(root, monitor, blocks)
             else:
