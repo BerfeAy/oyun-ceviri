@@ -10,6 +10,7 @@ import ctypes
 import os
 import queue
 import sys
+import time
 import traceback
 import threading
 import tkinter as tk
@@ -20,6 +21,7 @@ import mss
 import winocr
 from PIL import Image
 from deep_translator import GoogleTranslator
+from deep_translator.exceptions import TooManyRequests
 
 HOTKEY = "f8"
 QUIT_KEY = "f9"
@@ -90,6 +92,47 @@ def merge_paragraphs(lines):
     return paras
 
 
+def translate_one(text):
+    """Tek bir metni çevir; hız sınırına takılırsa bekleyip tekrar dene."""
+    for attempt in range(4):
+        try:
+            return translator.translate(text) or text
+        except TooManyRequests:
+            time.sleep(1.0 * (attempt + 1))
+    return text
+
+
+def translate_all(texts):
+    """Metinleri az sayıda istekle çevir (Google hız sınırına takılmamak için)."""
+    chunks, cur, cur_len = [], [], 0
+    for t in texts:
+        if cur and cur_len + len(t) + 1 > 4000:
+            chunks.append(cur)
+            cur, cur_len = [], 0
+        cur.append(t)
+        cur_len += len(t) + 1
+    if cur:
+        chunks.append(cur)
+
+    out = []
+    for ch in chunks:
+        parts = None
+        try:
+            r = translator.translate("\n".join(ch))
+            cand = r.split("\n") if r else []
+            if len(cand) == len(ch):
+                parts = cand
+        except Exception:
+            parts = None
+        if parts is None:  # Toplu çeviri tutmadıysa tek tek, yavaşça çevir
+            parts = []
+            for t in ch:
+                parts.append(translate_one(t))
+                time.sleep(0.25)
+        out.extend(parts)
+    return out
+
+
 def log_error(stage):
     """Hatayı exe'nin yanındaki hata_log.txt dosyasına yaz."""
     try:
@@ -109,7 +152,7 @@ def work(img, monitor):
         blocks = merge_paragraphs(read_lines(img))
         stage = "Çeviri"
         if blocks:
-            translated = translator.translate_batch([b[4] for b in blocks])
+            translated = translate_all([b[4] for b in blocks])
             for b, t in zip(blocks, translated):
                 b[4] = t or b[4]
         results.put((monitor, blocks, None))
