@@ -1,0 +1,39 @@
+name: Build Windows exe
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bagimliliklari kur
+        run: pip install -r requirements.txt
+
+      - name: exe olustur
+        run: pyinstaller --noconfirm --onefile --noconsole --uac-admin --name OyunCeviri --collect-all winocr --collect-submodules winrt --collect-binaries winrt oyun_ceviri.py
+
+      - name: Release'e yukle
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/OyunCeviri.exe
+
+      - name: Artifact olarak yukle (manuel calistirma icin)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: OyunCeviri
+          path: dist/OyunCeviri.exe
