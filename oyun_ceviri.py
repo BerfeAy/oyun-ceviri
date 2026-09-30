@@ -7,11 +7,15 @@ F9 : Programdan çık
 """
 
 import ctypes
+import json
 import os
 import queue
 import sys
 import time
 import traceback
+import urllib.error
+import urllib.parse
+import urllib.request
 import threading
 import tkinter as tk
 import tkinter.font as tkfont
@@ -20,8 +24,6 @@ import keyboard
 import mss
 import winocr
 from PIL import Image
-from deep_translator import GoogleTranslator
-from deep_translator.exceptions import TooManyRequests
 
 HOTKEY = "f8"
 QUIT_KEY = "f9"
@@ -37,8 +39,7 @@ except Exception:
 
 events = queue.Queue()
 results = queue.Queue()
-state = {"visible": False, "busy": False, "overlay": None, "note": None, "job": 0, "started": 0.0}
-translator = GoogleTranslator(source="auto", target="tr")
+state = {"visible": False, "busy": False, "overlay": None, "note": None, "job": 0, "started": 0.0, "stage": ""}
 
 
 def _g(obj, key):
@@ -92,12 +93,35 @@ def merge_paragraphs(lines):
     return paras
 
 
+class RateLimited(Exception):
+    pass
+
+
+def gtranslate(text, timeout=6):
+    """Google'ın ücretsiz çeviri ucuna zaman sınırlı istek at."""
+    url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=tr&dt=t"
+    data = urllib.parse.urlencode({"q": text}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        if e.code in (429, 503):
+            raise RateLimited(f"Google hız sınırı uyguladı (HTTP {e.code}). Birkaç dakika bekle.")
+        raise
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        raise RateLimited("Google beklenmeyen yanıt verdi (geçici engel olabilir). Birkaç dakika bekle.")
+    return "".join(seg[0] for seg in parsed[0] if seg and seg[0])
+
+
 def translate_one(text, deadline):
-    """Tek metni çevir. Hız sınırına takılırsa kısa bekleyip dener, süre dolunca None döner."""
+    """Tek metni çevir; hız sınırında kısa bekleyip dener, süre dolunca None döner."""
     while time.time() < deadline:
         try:
-            return translator.translate(text)
-        except TooManyRequests:
+            return gtranslate(text)
+        except RateLimited:
             time.sleep(1.5)
         except Exception:
             return None
@@ -118,16 +142,24 @@ def translate_all(texts, deadline):
 
     out = []
     for ch in chunks:
-        parts = None
-        if time.time() < deadline:
+        parts, limited = None, False
+        for _ in range(2):
+            if time.time() >= deadline:
+                break
             try:
-                r = translator.translate("\n".join(ch))
-                cand = r.split("\n") if r else []
+                cand = gtranslate("\n".join(ch)).split("\n")
                 if len(cand) == len(ch):
                     parts = cand
+                limited = False
+                break
+            except RateLimited:
+                limited = True
+                time.sleep(2)
             except Exception:
-                parts = None
-        if parts is None:  # Toplu çeviri tutmadıysa tek tek, yavaşça
+                break
+        if limited and parts is None:
+            raise RateLimited("Google hız sınırı uyguladı. Birkaç dakika bekleyip tekrar dene.")
+        if parts is None:  # Toplu çeviri satırları tutturamadıysa tek tek çevir
             parts = []
             for t in ch:
                 parts.append(translate_one(t, deadline) if time.time() < deadline else None)
@@ -140,31 +172,46 @@ def norm(x):
     return "".join(c for c in x.lower() if c.isalnum())
 
 
-def log_error(stage):
-    """Hatayı exe'nin yanındaki hata_log.txt dosyasına yaz."""
+def _log_path():
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(sys.executable)
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, "hata_log.txt")
+
+
+def log(msg):
     try:
-        if getattr(sys, "frozen", False):
-            base = os.path.dirname(sys.executable)
-        else:
-            base = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(base, "hata_log.txt"), "a", encoding="utf-8") as f:
-            f.write(f"[{stage}]\n{traceback.format_exc()}\n\n")
+        with open(_log_path(), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S") + "  " + msg + "\n")
     except Exception:
         pass
 
 
+def log_error(stage):
+    log(f"HATA [{stage}]\n{traceback.format_exc()}")
+
+
 def work(job, img, monitor):
     stage = "OCR"
+    state["stage"] = stage
     try:
-        blocks = merge_paragraphs(read_lines(img))
-        stage = "Çeviri"
+        t0 = time.time()
+        log("OCR basladi")
+        lines = read_lines(img)
+        blocks = merge_paragraphs(lines)
+        log(f"OCR bitti: {len(lines)} satir, {len(blocks)} blok, {time.time() - t0:.1f} sn")
+
+        stage = "çeviri"
+        state["stage"] = stage
         kept = []
         if blocks:
-            translated = translate_all([b[4] for b in blocks], time.time() + 20)
+            t1 = time.time()
+            log("Ceviri basladi")
+            translated = translate_all([b[4] for b in blocks], time.time() + 18)
+            log(f"Ceviri bitti: {sum(1 for t in translated if t)}/{len(translated)} blok, {time.time() - t1:.1f} sn")
             if not any(translated):
-                raise RuntimeError(
-                    "Çeviri sunucusundan yanıt alınamadı (hız sınırı olabilir, 1-2 dk bekleyip tekrar dene)"
-                )
+                raise RuntimeError("Çeviri sunucusundan yanıt alınamadı (internet veya Google engeli)")
             for b, t in zip(blocks, translated):
                 if not t or norm(t) == norm(b[4]):
                     continue  # çevrilemedi veya zaten Türkçe -> dokunma
@@ -300,7 +347,7 @@ def main():
         if state["busy"] and time.time() - state["started"] > 30:
             state["busy"] = False
             state["job"] += 1
-            notify(root, "Zaman aşımı: çeviri sunucusu yanıt vermedi. Tekrar dene.", 5000)
+            notify(root, f"Zaman aşımı ({state['stage']} aşamasında takıldı). Ayrıntı: hata_log.txt", 6000)
 
         root.after(50, poll)
 
